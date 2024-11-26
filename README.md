@@ -1,6 +1,8 @@
 # Ingestion Benchmark Tool
 
-This Rust program benchmarks different methods of batch ingesting data into a PostgreSQL database. It supports various ingestion techniques such as `INSERT`, `COPY`, `Binary COPY`, and `UNNEST` and measures their performance in terms of rows per second and ingestion duration. The program is configurable via command-line arguments, making it a flexible tool for evaluating database ingestion strategies.
+This Rust program benchmarks different methods of batch ingesting data into a PostgreSQL database. It supports various ingestion techniques such as `INSERT`, `COPY`, `Binary COPY`, and `UNNEST` and measures their performance in terms of rows per second and ingestion duration. 
+
+The program is configurable via command-line arguments, making it a flexible tool for evaluating database ingestion strategies.
 
 The tool was orginally written for a blog, you can read it here.
 
@@ -53,6 +55,20 @@ unzip power_generation_1m.csv.zip
 ## Usage
 
 ### Run the Program
+`pgingester` will create it's own table to ingest data in. The schema is as follows:
+```sql
+CREATE TABLE IF NOT EXISTS power_generation (
+    generator_id INTEGER, 
+    timestamp TIMESTAMP WITH TIME ZONE,
+    power_output_kw DOUBLE PRECISION, 
+    voltage DOUBLE PRECISION,
+    current DOUBLE PRECISION,
+    frequency DOUBLE PRECISION,
+    temperature DOUBLE PRECISION
+ );
+```
+
+You can run `pgingester` as follows:
 ```bash
 ./target/release/pgingester --connection-string <YOUR_CONNECTION_STRING> [OPTIONS]
 ```
@@ -66,7 +82,7 @@ unzip power_generation_1m.csv.zip
 | `--batch-sizes`         | Batch sizes to test (comma-separated). Default: `1000`.                                                  |
 | `--transactions`        | Enable single transaction during ingestion. Default: `false`.                                            |
 | `--csv-output`          | Output results in CSV format. Default: `false`.                                                          |
-| `--input-file`          | Path to the input CSV file. Default: `battery_data.csv`.                                                 |
+| `--input-file`          | Path to the input CSV file. Default: `power_generation.csv`.                                             |
 | `--connection-string`   | PostgreSQL connection string (can also be set via `CONNECTION_STRING` environment variable).              |
 
 ---

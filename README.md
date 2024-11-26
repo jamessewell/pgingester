@@ -2,6 +2,8 @@
 
 This Rust program benchmarks different methods of batch ingesting data into a PostgreSQL database. It supports various ingestion techniques such as `INSERT`, `COPY`, `Binary COPY`, and `UNNEST` and measures their performance in terms of rows per second and ingestion duration. The program is configurable via command-line arguments, making it a flexible tool for evaluating database ingestion strategies.
 
+The tool was orginally written for a blog, you can read it here.
+
 ---
 
 ## Features
@@ -29,8 +31,6 @@ This Rust program benchmarks different methods of batch ingesting data into a Po
 - [Command-Line Options](#command-line-options)
 - [CSV Format](#csv-format)
 - [Example Usage](#example-usage)
-- [Development](#development)
-- [License](#license)
 
 ---
 

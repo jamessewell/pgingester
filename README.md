@@ -1,4 +1,4 @@
-# Ingestion Benchmark Tool
+# PostgreSQL Ingestion Benchmark Tool
 
 This Rust program benchmarks different methods of batch ingesting data into a PostgreSQL database. It supports various ingestion techniques such as `INSERT`, `COPY`, `Binary COPY`, and `UNNEST` and measures their performance in terms of rows per second and ingestion duration. 
 

@@ -4,7 +4,7 @@ This Rust program benchmarks different methods of batch ingesting data into a Po
 
 The program is configurable via command-line arguments, making it a flexible tool for evaluating database ingestion strategies.
 
-The tool was orginally written for a blog, you can read it here.
+The tool was orginally written for an ingest benchmarking blog for Timescale, you can read it [here](www.timescale.com/blog/benchmarking-postgresql-batch-ingest/).
 
 ---
 

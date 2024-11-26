@@ -108,8 +108,6 @@ The program reads sensor data from a CSV file with the following columns:
 ...
 ```
 
----
-
 ## Example Usage
 
 ### Benchmark All Methods
@@ -121,6 +119,9 @@ The program reads sensor data from a CSV file with the following columns:
 ```bash
 ./target/release/battery-data-benchmark     --methods InsertValues,Copy     --batch-sizes 1000     --csv-output true     --connection-string "postgresql://user:password@localhost:5432/mydb"
 ```
+
+### Output
+![image](https://github.com/user-attachments/assets/5d3b27f3-abf5-4ce5-8cfd-74f35a434202)
 
 ---
 Feel free to open an issue or submit a pull request for any feature requests or bug reports!

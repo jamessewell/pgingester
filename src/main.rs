@@ -251,6 +251,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         for batch_size in &cli.batch_sizes {
             for method in &methods {
                 let chunk_size = records.len() / cli.threads;
+                let mut client = Client::connect(&conn_info.connection_string, NoTls)?;
+                truncate_table(&mut client)?;  // Ensure table is clean before parallel insert
+
+                let start = std::time::Instant::now();
                 let thread_results = (0..cli.threads).into_par_iter().map(|i| {
                     let start_idx = i * chunk_size;
                     let end_idx = if i == cli.threads - 1 { records.len() } else { (i + 1) * chunk_size };
@@ -265,24 +269,22 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         IngestMethod::PreparedInsertUnnest => prepared_insert_unnest(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
                         IngestMethod::Copy => copy(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
                     }
-                }).collect::<Vec<Result<BenchmarkResult, Box<dyn Error + Send + Sync>>>>();
+                }).collect::<Result<Vec<_>, _>>()?;
 
-                // Aggregate results from all threads
-                if let Some(Ok(first_result)) = thread_results.first() {
-                    let total_duration = first_result.duration;
-                    let total_rows = records.len();
-                    let rows_per_sec = total_rows as f64 / total_duration.as_secs_f64();
-                    
-                    results.push(BenchmarkResult {
-                        connection_name: first_result.connection_name.clone(),
-                        method: first_result.method.clone(),
-                        batch_size: *batch_size,
-                        transaction: first_result.transaction,
-                        duration: total_duration,
-                        rows_per_sec,
-                        threads: cli.threads,
-                    });
-                }
+                // Calculate aggregate metrics
+                let duration = start.elapsed();
+                let total_rows = records.len();
+                let rows_per_sec = total_rows as f64 / duration.as_secs_f64();
+                
+                results.push(BenchmarkResult {
+                    connection_name: conn_info.name.clone(),
+                    method: thread_results[0].method.clone(),
+                    batch_size: *batch_size,
+                    transaction: cli.transactions,
+                    duration,
+                    rows_per_sec,
+                    threads: cli.threads,
+                });
             }
         }
     }

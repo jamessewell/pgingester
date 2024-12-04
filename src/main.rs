@@ -10,6 +10,8 @@ use std::env;
 use clap::{Parser, ValueEnum};
 use postgres::binary_copy::BinaryCopyInWriter;
 use prettytable::{Table, row};
+use postgres_openssl::MakeTlsConnector;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -148,8 +150,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| env::var("CONNECTION_STRING")
             .expect("CONNECTION_STRING must be provided via argument or environment variable"));
 
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = MakeTlsConnector::new(builder.build());
+
     let records: Vec<BatterySensorData> = read_csv(&cli.input_file)?;
-    let mut client = Client::connect(&connection_string, NoTls)?;
+    let mut client = match Client::connect(&connection_string, connector) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Warning: SSL connection failed ({}), falling back to non-SSL", e);
+            Client::connect(&connection_string, NoTls)?
+        }
+    };
     
     let mut results: Vec<BenchmarkResult> = Vec::new();
     

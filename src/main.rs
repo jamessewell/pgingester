@@ -205,6 +205,11 @@ fn print_results(results: &[BenchmarkResult], csv_output: bool, total_records: u
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     
+    // Add SSL connector setup
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = MakeTlsConnector::new(builder.build());
+
     // Parse connection strings
     let connections: Vec<ConnectionInfo> = if cli.connection_strings.is_empty() {
         // Default to environment variable if no connections specified
@@ -251,7 +256,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         for batch_size in &cli.batch_sizes {
             for method in &methods {
                 let chunk_size = records.len() / cli.threads;
-                let mut client = Client::connect(&conn_info.connection_string, NoTls)?;
+                let mut client = Client::connect(&conn_info.connection_string, connector.clone())?;
                 truncate_table(&mut client)?;  // Ensure table is clean before parallel insert
 
                 let start = std::time::Instant::now();
@@ -260,7 +265,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     let end_idx = if i == cli.threads - 1 { records.len() } else { (i + 1) * chunk_size };
                     let thread_records = &records[start_idx..end_idx];
                     
-                    let mut thread_client = Client::connect(&conn_info.connection_string, NoTls)?;
+                    let mut thread_client = Client::connect(&conn_info.connection_string, connector.clone())?;
                     match method {
                         IngestMethod::BinaryCopy => binary_copy(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
                         IngestMethod::InsertValues => insert_values(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),

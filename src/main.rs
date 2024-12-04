@@ -12,6 +12,8 @@ use postgres::binary_copy::BinaryCopyInWriter;
 use prettytable::{Table, row};
 use postgres_openssl::MakeTlsConnector;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use rayon::prelude::*;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
@@ -20,7 +22,7 @@ struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    fn from_str(s: &str, ordinal: usize) -> Result<Self, Box<dyn Error>> {
+    fn from_str(s: &str, unnamed_ordinal: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let connection_string = if s.starts_with("postgresql://") || s.starts_with("postgres://") {
             s.to_string()
         } else if let Some(rest) = s.strip_prefix("://") {
@@ -33,12 +35,12 @@ impl ConnectionInfo {
 
         let name = if let Some((prefix, _)) = s.split_once("://") {
             if prefix == "postgresql" || prefix == "postgres" {
-                format!("postgres-{}", ordinal + 1)
+                format!("connection {}", unnamed_ordinal + 1)
             } else {
                 prefix.to_string()
             }
         } else {
-            format!("postgres-{}", ordinal + 1)
+            format!("postgres-{}", unnamed_ordinal + 1)
         };
 
         Ok(ConnectionInfo {
@@ -71,6 +73,9 @@ struct Cli {
 
     #[arg(short = 'f', long, default_value = "power_generation_1m.csv")]
     input_file: String,
+
+    #[arg(short = 't', long, default_value = "1")]
+    threads: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -83,7 +88,7 @@ enum IngestMethod {
     BinaryCopy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BatterySensorData {
     id: i32,
     timestamp: DateTime<Utc>,
@@ -102,9 +107,10 @@ struct BenchmarkResult {
     transaction: bool,
     duration: std::time::Duration,
     rows_per_sec: f64,
+    threads: usize,
 }
 
-fn truncate_table(client: &mut Client) -> Result<(), Box<dyn Error>> {
+fn truncate_table(client: &mut Client) -> Result<(), Box<dyn Error + Send + Sync>> {
     client.simple_query("
         CREATE TABLE IF NOT EXISTS power_generation (
             generator_id INTEGER,               -- Unique identifier for the generator or energy source
@@ -128,7 +134,8 @@ fn create_benchmark_result(
     duration: std::time::Duration, 
     rows_per_sec: f64, 
     transactions: bool, 
-    batch_size: usize
+    batch_size: usize,
+    threads: usize,
 ) -> BenchmarkResult {
     BenchmarkResult {
         connection_name: connection_name.to_string(),
@@ -137,6 +144,7 @@ fn create_benchmark_result(
         transaction: transactions,
         duration,
         rows_per_sec,
+        threads,
     }
 }
 
@@ -147,13 +155,14 @@ fn print_results(results: &[BenchmarkResult], csv_output: bool, total_records: u
         .unwrap_or(1.0);
 
     if csv_output {
-        println!("Connection,Method,Batch Size,Transaction,Duration,Rows/sec,Relative Speed");
+        println!("Connection,Method,Batch Size,Transaction,Threads,Duration,Rows/sec,Relative Speed");
         for result in results {
-            println!("{},{},{},{},{:.2?},{:.0},x{:.2}",
+            println!("{},{},{},{},{},{:.2?},{:.0},x{:.2}",
                 result.connection_name,
                 result.method,
                 result.batch_size,
                 if result.transaction { "Yes" } else { "No" },
+                result.threads,
                 result.duration,
                 result.rows_per_sec,
                 max_speed / result.rows_per_sec
@@ -170,6 +179,7 @@ fn print_results(results: &[BenchmarkResult], csv_output: bool, total_records: u
             b->"Method",
             b->"Batch Size",
             b->"Transaction",
+            b->"Threads",
             b->"Duration",
             b->"Rows/sec",
             b->"Relative Speed"
@@ -181,6 +191,7 @@ fn print_results(results: &[BenchmarkResult], csv_output: bool, total_records: u
                 result.method,
                 format!("{}", result.batch_size),
                 if result.transaction { "Yes" } else { "No" },
+                format!("{}", result.threads),
                 format!("{:.2?}", result.duration),
                 format!("{:.0}", result.rows_per_sec),
                 format!("x{:.2}", max_speed / result.rows_per_sec)
@@ -191,7 +202,7 @@ fn print_results(results: &[BenchmarkResult], csv_output: bool, total_records: u
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
     
     // Parse connection strings
@@ -213,26 +224,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let records: Vec<BatterySensorData> = read_csv(&cli.input_file)?;
     let mut results: Vec<BenchmarkResult> = Vec::new();
 
+    // Set up thread pool once
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.threads)
+        .build_global()
+        .unwrap();
+
     // For each connection
     for conn_info in &connections {
         eprintln!("Testing connection: {}", conn_info.name);
         
-        let mut builder = SslConnector::builder(SslMethod::tls())?;
-        builder.set_verify(SslVerifyMode::NONE);
-        let connector = MakeTlsConnector::new(builder.build());
-
-        let mut client = match Client::connect(&conn_info.connection_string, connector) {
-            Ok(client) => {
-                eprintln!("Successfully connected with SSL to {}", conn_info.name);
-                client
-            },
-            Err(e) => {
-                eprintln!("SSL connection failed for {}: {}", conn_info.name, e);
-                eprintln!("Attempting fallback to non-SSL connection...");
-                Client::connect(&conn_info.connection_string, NoTls)?
-            }
-        };
-
         let methods = if cli.all {
             vec![
                 IngestMethod::InsertValues,
@@ -249,15 +250,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Run benchmarks for this connection
         for batch_size in &cli.batch_sizes {
             for method in &methods {
-                let result = match method {
-                    IngestMethod::InsertValues => insert_values(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                    IngestMethod::PreparedInsertValues => prepared_insert_values(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                    IngestMethod::InsertUnnest => insert_unnest(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                    IngestMethod::PreparedInsertUnnest => prepared_insert_unnest(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                    IngestMethod::Copy => copy(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                    IngestMethod::BinaryCopy => binary_copy(&mut client, records.as_slice(), cli.transactions, *batch_size, conn_info)?,
-                };
-                results.push(result);
+                let chunk_size = records.len() / cli.threads;
+                let thread_results = (0..cli.threads).into_par_iter().map(|i| {
+                    let start_idx = i * chunk_size;
+                    let end_idx = if i == cli.threads - 1 { records.len() } else { (i + 1) * chunk_size };
+                    let thread_records = &records[start_idx..end_idx];
+                    
+                    let mut thread_client = Client::connect(&conn_info.connection_string, NoTls)?;
+                    match method {
+                        IngestMethod::BinaryCopy => binary_copy(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                        IngestMethod::InsertValues => insert_values(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                        IngestMethod::PreparedInsertValues => prepared_insert_values(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                        IngestMethod::InsertUnnest => insert_unnest(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                        IngestMethod::PreparedInsertUnnest => prepared_insert_unnest(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                        IngestMethod::Copy => copy(&mut thread_client, thread_records, cli.transactions, *batch_size, conn_info, cli.threads),
+                    }
+                }).collect::<Vec<Result<BenchmarkResult, Box<dyn Error + Send + Sync>>>>();
+
+                // Aggregate results from all threads
+                if let Some(Ok(first_result)) = thread_results.first() {
+                    let total_duration = first_result.duration;
+                    let total_rows = records.len();
+                    let rows_per_sec = total_rows as f64 / total_duration.as_secs_f64();
+                    
+                    results.push(BenchmarkResult {
+                        connection_name: first_result.connection_name.clone(),
+                        method: first_result.method.clone(),
+                        batch_size: *batch_size,
+                        transaction: first_result.transaction,
+                        duration: total_duration,
+                        rows_per_sec,
+                        threads: cli.threads,
+                    });
+                }
             }
         }
     }
@@ -268,7 +293,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_csv(path: &str) -> Result<Vec<BatterySensorData>, Box<dyn Error>> {
+fn read_csv(path: &str) -> Result<Vec<BatterySensorData>, Box<dyn Error + Send + Sync>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut csv_reader = Reader::from_reader(reader);
@@ -290,8 +315,14 @@ fn read_csv(path: &str) -> Result<Vec<BatterySensorData>, Box<dyn Error>> {
     Ok(records)
 }
 
-fn insert_unnest(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
-{
+fn insert_unnest(
+    client: &mut Client, 
+    records: &[BatterySensorData], 
+    transactions: bool, 
+    batch_size: usize, 
+    conn_info: &ConnectionInfo,
+    threads: usize
+) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>> {
     truncate_table(client)?;
     
     let start = std::time::Instant::now();
@@ -299,31 +330,33 @@ fn insert_unnest(client: &mut Client, records: &[BatterySensorData], transaction
         client.simple_query("BEGIN")?;
     }
 
-    let stmt = 
-        "INSERT INTO power_generation 
-         SELECT * FROM unnest($1::int4[], $2::timestamptz[], $3::float8[], $4::float8[], $5::float8[], $6::float8[], $7::float8[])";
+    let stmt = "INSERT INTO power_generation 
+                SELECT * FROM unnest($1::int4[], $2::timestamptz[], $3::float8[], $4::float8[], $5::float8[], $6::float8[], $7::float8[])";
+    
+    records.chunks(batch_size)
+        .try_for_each(|chunk| {
+            let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(chunk.len());
+            let mut ids: Vec<i32> = Vec::with_capacity(chunk.len());
+            let mut voltages: Vec<f64> = Vec::with_capacity(chunk.len());
+            let mut currents: Vec<f64> = Vec::with_capacity(chunk.len());
+            let mut temperatures: Vec<f64> = Vec::with_capacity(chunk.len());
+            let mut socs: Vec<f64> = Vec::with_capacity(chunk.len());
+            let mut resistances: Vec<f64> = Vec::with_capacity(chunk.len());
 
-    for chunk in records.chunks(batch_size) {
-        let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(chunk.len());
-        let mut ids: Vec<i32> = Vec::with_capacity(chunk.len());
-        let mut voltages: Vec<f64> = Vec::with_capacity(chunk.len());
-        let mut currents: Vec<f64> = Vec::with_capacity(chunk.len());
-        let mut temperatures: Vec<f64> = Vec::with_capacity(chunk.len());
-        let mut socs: Vec<f64> = Vec::with_capacity(chunk.len());
-        let mut resistances: Vec<f64> = Vec::with_capacity(chunk.len());
+            for record in chunk {
+                ids.push(record.id);
+                timestamps.push(record.timestamp);
+                voltages.push(record.voltage);
+                currents.push(record.current);
+                temperatures.push(record.temperature);
+                socs.push(record.state_of_charge);
+                resistances.push(record.internal_resistance);
+            }
 
-        for record in chunk {
-            ids.push(record.id);
-            timestamps.push(record.timestamp);
-            voltages.push(record.voltage);
-            currents.push(record.current);
-            temperatures.push(record.temperature);
-            socs.push(record.state_of_charge);
-            resistances.push(record.internal_resistance);
-        }
+            client.execute(stmt, &[&ids, &timestamps, &voltages, &currents, &temperatures, &socs, &resistances])?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        })?;
 
-        client.execute(stmt, &[&ids, &timestamps, &voltages, &currents, &temperatures, &socs, &resistances])?;
-    }
     if transactions {
         client.simple_query("COMMIT")?;
     }
@@ -335,11 +368,12 @@ fn insert_unnest(client: &mut Client, records: &[BatterySensorData], transaction
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
 
-fn copy(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
+fn copy(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo, threads: usize) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>>
 {
     truncate_table(client)?;
     
@@ -376,11 +410,12 @@ fn copy(client: &mut Client, records: &[BatterySensorData], transactions: bool, 
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
 
-fn binary_copy(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
+fn binary_copy(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo, threads: usize) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>>
 {
     truncate_table(client)?;
     
@@ -417,11 +452,12 @@ fn binary_copy(client: &mut Client, records: &[BatterySensorData], transactions:
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
 
-fn insert_values(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
+fn insert_values(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo, threads: usize) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>>
 {
     truncate_table(client)?;
     
@@ -433,7 +469,8 @@ fn insert_values(client: &mut Client, records: &[BatterySensorData], transaction
             std::time::Duration::from_secs(0),
             0.0,
             transactions,
-            batch_size
+            batch_size,
+            threads
         ));
     }
     let start = std::time::Instant::now();
@@ -477,11 +514,12 @@ fn insert_values(client: &mut Client, records: &[BatterySensorData], transaction
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
 
-fn prepared_insert_values(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
+fn prepared_insert_values(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo, threads: usize) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>>
 {
     truncate_table(client)?;
     
@@ -493,7 +531,8 @@ fn prepared_insert_values(client: &mut Client, records: &[BatterySensorData], tr
             std::time::Duration::from_secs(0),
             0.0,
             transactions,
-            batch_size
+            batch_size,
+            threads
         ));
     }
     let start = std::time::Instant::now();
@@ -539,11 +578,12 @@ fn prepared_insert_values(client: &mut Client, records: &[BatterySensorData], tr
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
 
-fn prepared_insert_unnest(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo) -> Result<BenchmarkResult, Box<dyn Error>>
+fn prepared_insert_unnest(client: &mut Client, records: &[BatterySensorData], transactions: bool, batch_size: usize, conn_info: &ConnectionInfo, threads: usize) -> Result<BenchmarkResult, Box<dyn Error + Send + Sync>>
 {
     truncate_table(client)?;
     
@@ -590,6 +630,7 @@ fn prepared_insert_unnest(client: &mut Client, records: &[BatterySensorData], tr
         duration,
         rows_per_sec,
         transactions,
-        batch_size
+        batch_size,
+        threads
     ))
 }
